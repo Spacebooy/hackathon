@@ -1,0 +1,11 @@
+#!/bin/bash
+echo "=== Checking Camera Connection ==="
+echo ""
+echo "1. Video devices:"
+ls -l /dev/video* 2>/dev/null || echo "No video devices found!"
+echo ""
+echo "2. USB devices (looking for camera):"
+lsusb 2>/dev/null | grep -i "camera\|logitech\|webcam" || echo "lsusb not available or no camera found"
+echo ""
+echo "3. Video4Linux devices:"
+v4l2-ctl --list-devices 2>/dev/null || echo "v4l2-ctl not installed. Install with: sudo apt install v4l-utils"

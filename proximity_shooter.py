@@ -66,20 +66,52 @@ class ProximityShooter:
     """
     Simple shooting system - fires when target gets close to shooting point
     """
-    def __init__(self, motor_pin=17, fire_duration=0.15):
+    def __init__(self, motor_pin=17, fire_duration=0.15, camera_device=0):
         """
         Args:
             motor_pin: GPIO pin for motor control (default: GPIO 17)
             fire_duration: How long to activate motor in seconds (default: 0.15s)
+            camera_device: Video device number (default: 0)
         """
         # Motor controller
         self.motor = MotorController(motor_pin=motor_pin, fire_duration=fire_duration)
         
-        # Camera setup
-        self.camera = cv2.VideoCapture(0)
-        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        # Camera setup - try common devices (prioritize 0 and 1 based on available devices)
+        devices_to_try = [0, 1, camera_device] if camera_device not in [0, 1] else [camera_device, 0, 1]
+        self.camera = None
+        
+        for device in devices_to_try:
+            print(f"📷 Trying camera device {device}...")
+            try:
+                cam = cv2.VideoCapture(device, cv2.CAP_V4L2)  # Force V4L2 backend
+                # Suppress GStreamer warnings
+                cam.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M','J','P','G'))
+                ret, test_frame = cam.read()
+                if ret and test_frame is not None:
+                    print(f"✓ Camera device {device} works! Frame size: {test_frame.shape[1]}x{test_frame.shape[0]}")
+                    self.camera = cam
+                    self.camera_device = device
+                    break
+                else:
+                    cam.release()
+                    print(f"  ✗ Device {device} failed to read")
+            except Exception as e:
+                print(f"  ✗ Device {device} error: {e}")
+        
+        if self.camera is None:
+            print("❌ ERROR: Could not find a working camera!")
+            print("   Available devices: /dev/video0, /dev/video1, /dev/video10, /dev/video11")
+            print("   Try: ls -l /dev/video* to see all devices")
+            self.motor.cleanup()
+            raise RuntimeError("Camera initialization failed")
+        
+        print(f"✓ Using camera device {self.camera_device}")
+        
+        # Lower resolution for better FPS on Raspberry Pi
+        self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
+        self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
         self.camera.set(cv2.CAP_PROP_FPS, 30)
+        self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer lag
         
         # Detection parameters
         self.lower_green = np.array([35, 50, 50])
@@ -88,10 +120,12 @@ class ProximityShooter:
         self.max_circle_radius = 100
         self.min_area = 50
         
-        # Shooting parameters
-        self.shooting_point = None  # (x, y) where to shoot
-        self.shooting_point_set = False
-        self.fire_distance = 30  # Fire when target within this many pixels
+        # Shooting parameters - hardcoded for headless operation
+        # Set to center of frame (320x240 resolution), 30 pixels below center
+        self.shooting_point = (160, 150)  # (x, y) where to shoot - center is (160, 120), +30 = 150
+        self.shooting_point_set = True
+        self.fire_distance = 20  # Fire when target within this many pixels (adjusted for lower res)
+        print(f"🎯 Shooting point set to: {self.shooting_point} (center + 30px down)")
         
         # Firing state
         self.last_fire_time = 0
@@ -112,38 +146,23 @@ class ProximityShooter:
         self.motor_delay = 0.05  # Time for motor to fire (seconds)
         self.dart_speed = 15.0   # Nerf dart speed (m/s) - adjust based on your gun
         self.pixels_per_meter = 200  # Rough estimate - calibrate this!
-        self.lead_compensation_enabled = True  # Toggle with 'l' key
-        
-        # Display settings
-        self.show_mask = False
-        self.show_distance_circle = True
-        
-        # Setup mouse callback
-        cv2.namedWindow('Proximity Shooter')
-        cv2.setMouseCallback('Proximity Shooter', self._mouse_callback)
+        self.lead_compensation_enabled = True
         
         # Statistics
         self.shot_count = 0
         
-    def _mouse_callback(self, event, x, y, flags, param):
-        """Handle mouse clicks to set shooting point"""
-        if event == cv2.EVENT_LBUTTONDOWN:
-            self.shooting_point = (x, y)
-            self.shooting_point_set = True
-            print(f"\n🎯 Shooting point set to: ({x}, {y})")
-            print(f"   Will fire when target within {self.fire_distance} pixels")
-    
     def detect_green_circles(self, frame):
         """
         Detect all green circles in frame
         Returns: list of circles, mask
         """
+        # Resize for faster processing if needed
         hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
         mask = cv2.inRange(hsv, self.lower_green, self.upper_green)
         
-        kernel = np.ones((5, 5), np.uint8)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+        # Simplified morphology for speed
+        kernel = np.ones((3, 3), np.uint8)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
         
         contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
@@ -159,16 +178,12 @@ class ProximityShooter:
             if radius < self.min_circle_radius or radius > self.max_circle_radius:
                 continue
             
-            perimeter = cv2.arcLength(contour, True)
-            if perimeter > 0:
-                circularity = 4 * np.pi * area / (perimeter * perimeter)
-                
-                if circularity > 0.6:
-                    circles.append({
-                        'center': (int(x), int(y)),
-                        'radius': int(radius),
-                        'area': area
-                    })
+            # Simplified circularity check for speed (skip if too expensive)
+            circles.append({
+                'center': (int(x), int(y)),
+                'radius': int(radius),
+                'area': area
+            })
         
         return circles, mask
     
@@ -262,51 +277,18 @@ class ProximityShooter:
         # Cooldown notice
         print(f"⏱️  Cooldown: {self.fire_cooldown}s (next shot available at {time.time() + self.fire_cooldown:.2f})")
     
-    def draw_shooting_point(self, frame):
-        """Draw the shooting target point"""
-        if not self.shooting_point_set:
-            # Draw instruction
-            h, w = frame.shape[:2]
-            cv2.putText(frame, "Click to set shooting point", 
-                       (w//2 - 150, h//2),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-            return
-        
-        # Draw crosshair
-        x, y = self.shooting_point
-        size = 25
-        
-        # Lines
-        cv2.line(frame, (x - size, y), (x + size, y), (0, 0, 255), 3)
-        cv2.line(frame, (x, y - size), (x, y + size), (0, 0, 255), 3)
-        
-        # Center circle
-        cv2.circle(frame, self.shooting_point, 8, (0, 0, 255), 2)
-        
-        # Label
-        cv2.putText(frame, "SHOOT HERE", (x + 30, y - 30),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
-        
-        # Fire distance circle
-        if self.show_distance_circle:
-            cv2.circle(frame, self.shooting_point, self.fire_distance, (255, 0, 0), 2)
-            cv2.putText(frame, f"{self.fire_distance}px", (x + 35, y + 15),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 0, 0), 1)
-    
-    def draw_circles(self, frame, circles):
-        """Draw detected circles and check for firing"""
+    def process_targets(self, circles):
+        """Process detected circles and check for firing (headless version)"""
         closest_distance = float('inf')
         closest_circle = None
-        warning_zone_distance = self.fire_distance * 2  # Yellow "getting close" zone (normal)
+        warning_zone_distance = self.fire_distance * 2
         
         # Track if any target is in the FIRE zone this frame (red zone)
         current_target_in_fire_zone = False
         
         for circle in circles:
             center = circle['center']
-            radius = circle['radius']
             
-            # Calculate distance to shooting point
             if self.shooting_point_set:
                 distance = self.calculate_distance(center, self.shooting_point)
                 
@@ -315,168 +297,56 @@ class ProximityShooter:
                 
                 # Calculate lead-compensated distance
                 lead_distance = self.calculate_lead_distance(center)
-                effective_distance = distance - lead_distance  # Fire when "earlier" by lead amount
+                effective_distance = distance - lead_distance
                 
-                # Check if in fire zone (red zone) - this is what prevents re-firing
+                # Check if in fire zone (red zone)
                 if distance <= self.fire_distance:
                     current_target_in_fire_zone = True
-                
-                # Color based on distance
-                if distance <= self.fire_distance:
-                    color = (0, 0, 255)  # Red - in fire zone!
-                    thickness = 3
                     
-                    if effective_distance < closest_distance:  # Use lead-compensated distance
+                    if effective_distance < closest_distance:
                         closest_distance = effective_distance
                         closest_circle = circle
+                        # Print status when target is close
+                        status = f"🎯 TARGET IN RANGE: {int(distance)}px"
+                        if self.lead_compensation_enabled and self.target_velocity:
+                            status += f" (lead: {int(lead_distance)}px)"
+                        print(status)
                 elif distance <= warning_zone_distance:
-                    color = (0, 255, 255)  # Yellow - getting close
-                    thickness = 2
-                else:
-                    color = (0, 255, 0)  # Green - far away
-                    thickness = 2
-                
-                # Draw circle
-                cv2.circle(frame, center, radius, color, thickness)
-                cv2.circle(frame, center, 3, (0, 0, 255), -1)
-                
-                # Draw distance line
-                cv2.line(frame, center, self.shooting_point, (128, 128, 128), 1)
-                
-                # Distance label
-                mid_x = (center[0] + self.shooting_point[0]) // 2
-                mid_y = (center[1] + self.shooting_point[1]) // 2
-                label = f"{int(distance)}px"
-                if self.lead_compensation_enabled and self.target_velocity:
-                    lead_dist = self.calculate_lead_distance(center)
-                    label += f" (lead:{int(lead_dist)}px)"
-                cv2.putText(frame, label, (mid_x, mid_y),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-            else:
-                # No shooting point set - just draw green
-                cv2.circle(frame, center, radius, (0, 255, 0), 2)
-                cv2.circle(frame, center, 3, (0, 0, 255), -1)
+                    # Target getting close
+                    print(f"⚠️  Target approaching: {int(distance)}px")
         
         # Fire if: closest circle in fire zone AND conditions met
         if closest_circle is not None and self.should_fire():
             self.fire()
-            self.zone_was_clear = False  # Prevent immediate re-fire
-            
-            # Visual feedback
-            cv2.circle(frame, self.shooting_point, 50, (0, 0, 255), 5)
+            self.zone_was_clear = False
         
         # Update zone state AFTER firing check
-        # Only reset when FIRE zone (red) clears, not just the yellow zone
         if not current_target_in_fire_zone and self.target_in_zone:
-            # Fire zone just cleared - can fire at next target
             self.zone_was_clear = True
+            print("✓ Fire zone cleared - ready for next target")
         
         self.target_in_zone = current_target_in_fire_zone
     
-    def draw_info_panel(self, frame):
-        """Draw information panel"""
-        # Background
-        cv2.rectangle(frame, (5, 5), (350, 180), (0, 0, 0), -1)
-        cv2.rectangle(frame, (5, 5), (350, 180), (0, 255, 0), 2)
-        
-        y = 30
-        h = 25
-        
-        # Title
-        cv2.putText(frame, "PROXIMITY SHOOTER", (15, y),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
-        y += h + 5
-        
-        # Armed status
-        if self.should_fire():
-            status = "✓ ARMED - READY TO FIRE"
-            color = (0, 255, 0)
-        else:
-            cooldown_remaining = self.fire_cooldown - (time.time() - self.last_fire_time)
-            status = f"⏱️ COOLDOWN: {cooldown_remaining:.2f}s"
-            color = (0, 165, 255)
-            
-            # Draw cooldown progress bar
-            bar_width = 320
-            bar_height = 10
-            progress = max(0.0, min(1.0, cooldown_remaining / self.fire_cooldown))  # Clamp 0-1
-            filled_width = int(bar_width * (1 - progress))
-            filled_width = max(0, min(bar_width, filled_width))  # Clamp to valid range
-            
-            # Background bar
-            cv2.rectangle(frame, (15, y + 5), (15 + bar_width, y + 5 + bar_height), (50, 50, 50), -1)
-            # Progress bar (only draw if filled_width > 0)
-            if filled_width > 0:
-                cv2.rectangle(frame, (15, y + 5), (15 + filled_width, y + 5 + bar_height), (0, 255, 0), -1)
-            # Border
-            cv2.rectangle(frame, (15, y + 5), (15 + bar_width, y + 5 + bar_height), (255, 255, 255), 1)
-        
-        cv2.putText(frame, f"Status: {status}", (15, y),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-        y += h + 15  # Extra space for progress bar
-        
-        # Shot count
-        cv2.putText(frame, f"Shots fired: {self.shot_count}", (15, y),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-        y += h
-        
-        # Zone status (tracks fire zone - red zone)
-        zone_status = "Target in FIRE ZONE" if self.target_in_zone else "Fire zone clear ✓"
-        zone_color = (0, 0, 255) if self.target_in_zone else (0, 255, 0)
-        cv2.putText(frame, f"Zone: {zone_status}", (15, y),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, zone_color, 1)
-        y += h
-        
-        # Shooting point
-        if self.shooting_point_set:
-            cv2.putText(frame, f"Target: {self.shooting_point}", (15, y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            y += h
-            
-            cv2.putText(frame, f"Fire distance: {self.fire_distance}px", (15, y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-            y += h
-            
-            # Lead compensation status
-            lead_status = "ON" if self.lead_compensation_enabled else "OFF"
-            lead_color = (0, 255, 0) if self.lead_compensation_enabled else (128, 128, 128)
-            cv2.putText(frame, f"Lead comp: {lead_status}", (15, y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, lead_color, 1)
-            
-            # Show velocity if available
-            if self.target_velocity and self.lead_compensation_enabled:
-                vx, vy = self.target_velocity
-                speed = np.sqrt(vx**2 + vy**2)
-                cv2.putText(frame, f"  Speed: {int(speed)}px/s", (15, y + 20),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.4, (200, 200, 200), 1)
-        else:
-            cv2.putText(frame, "Click to set target", (15, y),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 165, 0), 1)
-        
-        return frame
-    
     def run(self):
-        """Main loop"""
+        """Main loop - Headless mode"""
         print("=" * 60)
-        print("PROXIMITY SHOOTER")
+        print("PROXIMITY SHOOTER - HEADLESS MODE")
         print("=" * 60)
-        print("\nHow it works:")
-        print("  1. Click to set shooting point (crosshair)")
-        print("  2. Move green circle toward the crosshair")
-        print("  3. System fires automatically when circle gets close!")
-        print("\nControls:")
-        print("  CLICK - Set shooting point")
-        print("  q     - Quit")
-        print("  r     - Reset shot counter")
-        print("  m     - Toggle mask view")
-        print("  l     - Toggle LEAD COMPENSATION (predict target movement)")
-        print("  +     - Increase fire distance")
-        print("  -     - Decrease fire distance")
-        print()
-        print("Note: Won't fire again until target exits the RED fire zone (30px)")
-        print("      Yellow 'getting close' zone is 2x fire distance (60px)")
-        print("      LEAD COMPENSATION: Fires earlier to hit moving targets!")
-        print()
+        print("\n🎯 System Configuration:")
+        print(f"  • Shooting point: {self.shooting_point}")
+        print(f"  • Fire distance: {self.fire_distance}px")
+        print(f"  • Warning zone: {self.fire_distance * 2}px")
+        print(f"  • Lead compensation: {'ENABLED' if self.lead_compensation_enabled else 'DISABLED'}")
+        print(f"  • Camera device: {self.camera_device}")
+        print(f"  • Motor GPIO pin: {self.motor.motor_pin}")
+        print("\n⚙️  How it works:")
+        print("  1. Detects green circles moving in the camera view")
+        print("  2. Tracks their position and velocity")
+        print("  3. Fires automatically when target enters the fire zone!")
+        print("  4. Won't fire again until target exits the fire zone")
+        print("\n🛑 Press Ctrl+C to stop")
+        print("=" * 60)
+        print("\n🚀 Starting detection loop...")
         
         fps_time = time.time()
         fps_counter = 0
@@ -495,72 +365,30 @@ class ProximityShooter:
                 # Detect circles
                 circles, mask = self.detect_green_circles(frame)
                 
-                # Draw visualization
-                self.draw_shooting_point(frame)
-                self.draw_circles(frame, circles)
-                frame = self.draw_info_panel(frame)
+                # Process detection (headless - no GUI)
+                self.process_targets(circles)
                 
-                # FPS
+                # FPS tracking (update every 3 seconds to reduce overhead)
                 fps_counter += 1
-                if time.time() - fps_time > 1.0:
-                    fps_display = fps_counter
+                if time.time() - fps_time > 3.0:
+                    fps_display = fps_counter / 3.0
                     fps_counter = 0
                     fps_time = time.time()
+                    # Print periodic status update
+                    print(f"🔄 Status: FPS={fps_display:.1f}, Targets={len(circles)}, Shots={self.shot_count}")
                 
-                cv2.putText(frame, f"FPS: {fps_display}", 
-                           (frame.shape[1] - 100, 30),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-                
-                # Circles detected
-                cv2.putText(frame, f"Targets: {len(circles)}", 
-                           (frame.shape[1] - 130, 60),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-                
-                # Show windows
-                cv2.imshow('Proximity Shooter', frame)
-                
-                if self.show_mask:
-                    cv2.imshow('Mask', mask)
-                
-                # Handle keyboard
-                key = cv2.waitKey(1) & 0xFF
-                
-                if key == ord('q'):
-                    break
-                elif key == ord('r'):
-                    self.shot_count = 0
-                    self.target_in_zone = False
-                    self.zone_was_clear = True
-                    print("\n🔄 Shot counter reset and zone cleared")
-                elif key == ord('m'):
-                    self.show_mask = not self.show_mask
-                    if not self.show_mask:
-                        cv2.destroyWindow('Mask')
-                elif key == ord('l'):
-                    self.lead_compensation_enabled = not self.lead_compensation_enabled
-                    status = "ENABLED" if self.lead_compensation_enabled else "DISABLED"
-                    print(f"\n🎯 Lead compensation {status}")
-                elif key == ord('+') or key == ord('='):
-                    self.fire_distance += 5
-                    print(f"Fire distance: {self.fire_distance}px")
-                elif key == ord('-'):
-                    self.fire_distance = max(10, self.fire_distance - 5)
-                    print(f"Fire distance: {self.fire_distance}px")
-                
-                # Maintain timing
-                elapsed = time.time() - loop_start
-                if elapsed < 0.033:
-                    time.sleep(0.033 - elapsed)
+                # Headless mode - no keyboard input needed
+                # Press Ctrl+C to stop
+                # No artificial timing constraint - run as fast as possible
         
         except KeyboardInterrupt:
             print("\nStopping...")
         
         finally:
             self.camera.release()
-            cv2.destroyAllWindows()
             self.motor.cleanup()
-            print(f"\nFinal stats: {self.shot_count} shots fired")
-            print("System stopped.")
+            print(f"\n✓ Final stats: {self.shot_count} shots fired")
+            print("✓ System stopped.")
 
 
 def main():
