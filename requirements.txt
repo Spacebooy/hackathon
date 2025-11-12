@@ -1,0 +1,11 @@
+# Requirements for Nerf Turret Proximity Shooter
+# Install with: pip3 install -r requirements.txt
+
+# Core dependencies
+numpy>=1.21.0
+opencv-python>=4.5.0
+
+# Raspberry Pi GPIO (only needed on Raspberry Pi)
+# On Mac/Windows, this will fail to install but code will run in simulation mode
+RPi.GPIO>=0.7.0
+
