@@ -7,6 +7,7 @@ Detects green circles and shoots when they get close to the crosshair
 import cv2
 import numpy as np
 import time
+import platform
 
 # Try to import RPi.GPIO for Raspberry Pi
 try:
@@ -22,42 +23,48 @@ class MotorController:
     """
     Controls the torque motor to fire the nerf gun
     """
-    def __init__(self, motor_pin=17, fire_duration=0.15):
+    def __init__(self, motor_pin=17, fire_duration=0.15, pwm_frequency=1000, pwm_duty_cycle=100):
         """
         Args:
             motor_pin: GPIO pin number (BCM mode)
             fire_duration: How long to activate motor (seconds)
+            pwm_frequency: PWM frequency in Hz
+            pwm_duty_cycle: Duty cycle percentage (0-100)
         """
         self.motor_pin = motor_pin
         self.fire_duration = fire_duration
+        self.pwm_frequency = pwm_frequency
+        self.pwm_duty_cycle = max(0, min(100, pwm_duty_cycle))
         self.enabled = GPIO_AVAILABLE
-        
+        self.pwm = None
+
         if self.enabled:
             # Setup GPIO
             GPIO.setmode(GPIO.BCM)
             GPIO.setwarnings(False)
             GPIO.setup(self.motor_pin, GPIO.OUT)
-            GPIO.output(self.motor_pin, GPIO.LOW)
-            print(f"✓ Motor controller initialized on GPIO pin {self.motor_pin}")
+            self.pwm = GPIO.PWM(self.motor_pin, self.pwm_frequency)
+            print(f"✓ Motor controller initialized on GPIO pin {self.motor_pin} (PWM {self.pwm_frequency}Hz)")
         else:
             print("⚠ Motor controller in simulation mode")
     
     def fire(self):
         """Trigger the motor to fire"""
         if self.enabled:
-            # Activate motor
-            GPIO.output(self.motor_pin, GPIO.HIGH)
+            # Activate motor via PWM
+            self.pwm.start(self.pwm_duty_cycle)
             time.sleep(self.fire_duration)
-            GPIO.output(self.motor_pin, GPIO.LOW)
-            print(f"  → Motor fired for {self.fire_duration}s")
+            self.pwm.stop()
+            print(f"  → Motor PWM fired for {self.fire_duration}s at {self.pwm_duty_cycle}% duty")
         else:
             # Simulation mode
-            print(f"  → [SIMULATION] Motor would fire for {self.fire_duration}s")
+            print(f"  → [SIMULATION] Motor PWM would fire for {self.fire_duration}s at {self.pwm_duty_cycle}% duty")
     
     def cleanup(self):
         """Cleanup GPIO"""
         if self.enabled:
-            GPIO.output(self.motor_pin, GPIO.LOW)
+            if self.pwm is not None:
+                self.pwm.stop()
             GPIO.cleanup()
             print("✓ Motor controller cleaned up")
 
@@ -66,7 +73,8 @@ class ProximityShooter:
     """
     Simple shooting system - fires when target gets close to shooting point
     """
-    def __init__(self, motor_pin=17, fire_duration=0.15, camera_device=0):
+    def __init__(self, motor_pin=17, fire_duration=0.15, camera_device=0,
+                 pwm_frequency=1000, pwm_duty_cycle=100):
         """
         Args:
             motor_pin: GPIO pin for motor control (default: GPIO 17)
@@ -74,31 +82,45 @@ class ProximityShooter:
             camera_device: Video device number (default: 0)
         """
         # Motor controller
-        self.motor = MotorController(motor_pin=motor_pin, fire_duration=fire_duration)
+        self.motor = MotorController(motor_pin=motor_pin,
+                                     fire_duration=fire_duration,
+                                     pwm_frequency=pwm_frequency,
+                                     pwm_duty_cycle=pwm_duty_cycle)
         
         # Camera setup - try common devices (prioritize 0 and 1 based on available devices)
         devices_to_try = [0, 1, camera_device] if camera_device not in [0, 1] else [camera_device, 0, 1]
+        backends = [cv2.CAP_V4L2]
+        if platform.system() == "Darwin":
+            backends += [cv2.CAP_AVFOUNDATION, cv2.CAP_ANY]
+        else:
+            backends += [cv2.CAP_ANY]
         self.camera = None
+        camera_found = False
         
         for device in devices_to_try:
-            print(f"📷 Trying camera device {device}...")
-            try:
-                cam = cv2.VideoCapture(device, cv2.CAP_V4L2)  # Force V4L2 backend
-                # Suppress GStreamer warnings
-                cam.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M','J','P','G'))
-                ret, test_frame = cam.read()
-                if ret and test_frame is not None:
-                    print(f"✓ Camera device {device} works! Frame size: {test_frame.shape[1]}x{test_frame.shape[0]}")
-                    self.camera = cam
-                    self.camera_device = device
-                    break
-                else:
+            for backend in backends:
+                backend_name = "default" if backend == cv2.CAP_ANY else str(backend)
+                print(f"📷 Trying camera device {device} with backend {backend_name}...")
+                try:
+                    cam = cv2.VideoCapture(device, backend)
+                    if not cam.isOpened():
+                        cam.release()
+                        continue
+                    if platform.system() != "Darwin":
+                        cam.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc('M','J','P','G'))
+                    ret, test_frame = cam.read()
+                    if ret and test_frame is not None:
+                        print(f"✓ Camera device {device} works (backend {backend_name})! Frame size: {test_frame.shape[1]}x{test_frame.shape[0]}")
+                        self.camera = cam
+                        self.camera_device = device
+                        camera_found = True
+                        break
                     cam.release()
-                    print(f"  ✗ Device {device} failed to read")
-            except Exception as e:
-                print(f"  ✗ Device {device} error: {e}")
-        
-        if self.camera is None:
+                except Exception as e:
+                    print(f"  ✗ Device {device} backend {backend_name} error: {e}")
+            if camera_found:
+                break
+        if not camera_found:
             print("❌ ERROR: Could not find a working camera!")
             print("   Available devices: /dev/video0, /dev/video1, /dev/video10, /dev/video11")
             print("   Try: ls -l /dev/video* to see all devices")
@@ -106,12 +128,17 @@ class ProximityShooter:
             raise RuntimeError("Camera initialization failed")
         
         print(f"✓ Using camera device {self.camera_device}")
-        
-        # Lower resolution for better FPS on Raspberry Pi
+
+        # Lower resolution for better FPS on Raspberry Pi / laptops
         self.camera.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
         self.camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
         self.camera.set(cv2.CAP_PROP_FPS, 30)
-        self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)  # Reduce buffer lag
+        self.camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        # Warm-up frames to stabilize exposure/connection
+        for _ in range(10):
+            ret, _ = self.camera.read()
+            if not ret:
+                time.sleep(0.05)
         
         # Detection parameters
         self.lower_green = np.array([35, 50, 50])
@@ -569,3 +596,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
